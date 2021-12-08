@@ -3,6 +3,7 @@
 #include <pango/pangocairo.h>
 #include <pango/pango-fontmap.h>
 #include <pango/pango.h>
+#include <iconv.h>
 
 #ifdef __APPLE__
 #include <CoreText/CoreText.h>
@@ -10,6 +11,7 @@
 #include <windows.h>
 #else
 #include <fontconfig/fontconfig.h>
+#include <pango/pangofc-fontmap.h>
 #endif
 
 #include <ft2build.h>
@@ -35,8 +37,19 @@
 #define IS_PREFERRED_ENC(X) \
   X.platform_id == PREFERRED_PLATFORM_ID && X.encoding_id == PREFERRED_ENCODING_ID
 
+#if defined(__APPLE) || defined(_WIN32)
 #define GET_NAME_RANK(X) \
-  (IS_PREFERRED_ENC(X) ? 1 : 0) + (X.name_id == TT_NAME_ID_PREFERRED_FAMILY ? 1 : 0)
+  ((IS_PREFERRED_ENC(X) ? 1 : 0) << 1) | \
+  (X.name_id == TT_NAME_ID_PREFERRED_FAMILY ? 1 : 0)
+#else
+// On Linux-like OSes using FontConfig, the PostScript name ranks higher than
+// preferred family and family name since we'll use it to get perfect font
+// matching (see fc_font_map_substitute_hook)
+#define GET_NAME_RANK(X) \
+  ((IS_PREFERRED_ENC(X) ? 1 : 0) << 2) | \
+  ((X.name_id == TT_NAME_ID_PS_NAME ? 1 : 0) << 1) | \
+  (X.name_id == TT_NAME_ID_PREFERRED_FAMILY ? 1 : 0)
+#endif
 
 /*
  * Return a UTF-8 encoded string given a TrueType name buf+len
@@ -57,7 +70,7 @@ to_utf8(FT_Byte* buf, FT_UInt len, FT_UShort pid, FT_UShort eid) {
   char const *fromcode;
 
   if (pid == TT_PLATFORM_MACINTOSH && eid == TT_MAC_ID_ROMAN) {
-    fromcode = "MAC";
+    ffromcode = "Mac";
   } else if (pid == TT_PLATFORM_MICROSOFT && eid == TT_MS_ID_UNICODE_CS) {
     fromcode = "UTF-16BE";
   } else {
@@ -65,9 +78,9 @@ to_utf8(FT_Byte* buf, FT_UInt len, FT_UShort pid, FT_UShort eid) {
     return NULL;
   }
 
-  GIConv cd = g_iconv_open("UTF-8", fromcode);
+  iconv_t cd = iconv_open("UTF-8", fromcode);
 
-  if (cd == (GIConv)-1) {
+  if (cd == (iconv_t)-1) {
     free(ret);
     return NULL;
   }
@@ -75,7 +88,7 @@ to_utf8(FT_Byte* buf, FT_UInt len, FT_UShort pid, FT_UShort eid) {
   size_t inbytesleft = len;
   size_t outbytesleft = ret_len;
 
-  size_t n_converted = g_iconv(cd, (char**)&buf, &inbytesleft, &ret, &outbytesleft);
+  size_t n_converted = iconv(cd, (char**)&buf, &inbytesleft, &ret, &outbytesleft);
 
   ret -= ret_len - outbytesleft; // rewind the pointers to their
   buf -= len - inbytesleft;      // original starting positions
@@ -93,58 +106,51 @@ to_utf8(FT_Byte* buf, FT_UInt len, FT_UShort pid, FT_UShort eid) {
  * Find a family name in the face's name table, preferring the one the
  * system, fall back to the other
  */
-
-typedef struct _NameDef {
-  const char *buf;
-  int rank; // the higher the more desirable
-} NameDef;
-
-gint
-_name_def_compare(gconstpointer a, gconstpointer b) {
-  return ((NameDef*)a)->rank > ((NameDef*)b)->rank ? -1 : 1;
-}
-
-// Some versions of GTK+ do not have this, particualrly the one we
-// currently link to in node-canvas's wiki
-void
-_free_g_list_item(gpointer data, gpointer user_data) {
-  NameDef *d = (NameDef *)data;
-  free((void *)(d->buf));
-}
-
-void
-_g_list_free_full(GList *list) {
-  g_list_foreach(list, _free_g_list_item, NULL);
-  g_list_free(list);
-}
-
 char *
 get_family_name(FT_Face face) {
   FT_SfntName name;
-  GList *list = NULL;
-  char *utf8name = NULL;
+  int best_rank = -1;
+  char* best_buf = NULL;
 
   for (unsigned i = 0; i < FT_Get_Sfnt_Name_Count(face); ++i) {
     FT_Get_Sfnt_Name(face, i, &name);
 
-    if (name.name_id == TT_NAME_ID_FONT_FAMILY || name.name_id == TT_NAME_ID_PREFERRED_FAMILY) {
+    if (
+      name.name_id == TT_NAME_ID_FONT_FAMILY || 
+      #if !defined(__APPLE) && !defined(_WIN32)
+      name.name_id == TT_NAME_ID_PS_NAME ||
+      #endif
+      name.name_id == TT_NAME_ID_PREFERRED_FAMILY
+    ) {
       char *buf = to_utf8(name.string, name.string_len, name.platform_id, name.encoding_id);
 
       if (buf) {
-        NameDef *d = (NameDef*)malloc(sizeof(NameDef));
-        d->buf = (const char*)buf;
-        d->rank = GET_NAME_RANK(name);
+        int rank = GET_NAME_RANK(name);
+        if (rank > best_rank) {
+          best_rank = rank;
+          if (best_buf) free(best_buf);
+          best_buf = buf;
 
-        list = g_list_insert_sorted(list, (gpointer)d, _name_def_compare);
+          #if !defined(__APPLE) && !defined(_WIN32)
+          // Prepend an '@' to the family name
+          if (name.name_id == TT_NAME_ID_PS_NAME) {
+            size_t len = strlen(buf);
+            best_buf = (char *)malloc(len + 2);
+            best_buf[0] = '@';
+            strncpy(best_buf + 1, buf, len);
+            best_buf[len + 1] = '\0';
+            free(buf);
+          }
+          #endif
+
+        } else {
+          free(buf);
+        }
       }
     }
   }
 
-  GList *best_def = g_list_first(list);
-  if (best_def) utf8name = (char*) strdup(((NameDef*)best_def->data)->buf);
-  if (list) _g_list_free_full(list);
-
-  return utf8name;
+  return best_buf;
 }
 
 PangoWeight
@@ -233,6 +239,21 @@ get_pango_font_description(unsigned char* filepath) {
   return NULL;
 }
 
+#if !defined(__APPLE) && !defined(_WIN32)
+static void
+fc_font_map_substitute_hook(FcPattern *pat, gpointer data) {
+  FcChar8 *family;
+
+  for (int i = 0; FcPatternGetString(pat, FC_FAMILY, i, &family) == FcResultMatch; i++) {
+    if (family[0] == '@') {
+      FcPatternAddString(pat, FC_POSTSCRIPT_NAME, (FcChar8 *)family + 1);
+      FcPatternRemove(pat, FC_FAMILY, i);
+      i -= 1;
+    }
+  }
+}
+#endif
+
 /*
  * Register font with the OS
  */
@@ -256,6 +277,12 @@ register_font(unsigned char *filepath) {
   // has the effect of registering the new font in Pango by re-looking up all
   // font families.
   pango_cairo_font_map_set_default(NULL);
+
+  #if !defined(__APPLE) && !defined(_WIN32)
+    PangoFontMap* map = pango_cairo_font_map_get_default();
+    PangoFcFontMap* fc_map = PANGO_FC_FONT_MAP(map);
+    pango_fc_font_map_set_default_substitute(fc_map, fc_font_map_substitute_hook, NULL, NULL);
+  #endif
 
   return true;
 }
